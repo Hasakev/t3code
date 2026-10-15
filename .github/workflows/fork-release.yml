@@ -1,0 +1,313 @@
+name: Fork release
+
+# Fork-only. Merges upstream main into this fork's main, tests it, and publishes
+# a Windows x64 release whose installer updates itself from this repository's
+# GitHub Releases. See docs/operations/fork.md.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+# One release at a time. The sync job's own push re-triggers this workflow; the
+# queued run then finds HEAD already tagged and skips.
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Merge upstream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+    outputs:
+      ref: ${{ steps.merge.outputs.ref }}
+      upstream_ref: ${{ steps.merge.outputs.upstream_ref }}
+      version: ${{ steps.merge.outputs.version }}
+      skip: ${{ steps.merge.outputs.skip }}
+    steps:
+      # The PAT is what lets the push carry upstream's .github/workflows changes;
+      # GITHUB_TOKEN may not write workflow files.
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.FORK_SYNC_TOKEN }}
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          run-install: false
+
+      - id: merge
+        name: Merge upstream main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # --no-tags: upstream release tags would collide with this fork's vX.Y.Z tags.
+          git remote add --no-tags upstream https://github.com/pingdotgg/t3code.git
+          git fetch --no-tags upstream main
+
+          if ! git merge --no-edit upstream/main; then
+            files="$(git diff --name-only --diff-filter=U)"
+            git merge --abort
+            body="$(printf 'Merging upstream %s into main conflicts in:\n\n```\n%s\n```\n\nResolve locally with `node scripts/fork-sync.ts`, then push. Run: %s' \
+              "$(git rev-parse --short upstream/main)" "$files" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")"
+            issue="$(gh issue list --state open --search 'in:title "Upstream merge conflict"' --json number --jq '.[0].number // empty')"
+            if [[ -n "$issue" ]]; then
+              gh issue comment "$issue" --body "$body"
+            else
+              gh issue create --title "Upstream merge conflict" --body "$body"
+            fi
+            exit 1
+          fi
+
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+            git push origin HEAD:main
+          fi
+
+          {
+            echo "ref=$(git rev-parse HEAD)"
+            echo "upstream_ref=$(git rev-parse upstream/main)"
+            echo "version=$(node scripts/fork-version.ts)"
+            if git tag --points-at HEAD | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "skip=true"
+            else
+              echo "skip=false"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+      # Upstream workflows run on maintainer-only runners and secrets, and
+      # upstream adds new ones over time, so keep everything but this
+      # workflow and the build it calls disabled.
+      - name: Disable upstream-only workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow list --all --json id,path,state --jq '.[]
+            | select(.state == "active" and (.path | startswith(".github/workflows/")))
+            | select(.path != ".github/workflows/fork-release.yml" and .path != ".github/workflows/release-desktop.yml")
+            | .id' | while read -r id; do
+            gh workflow disable "$id"
+          done
+
+  test:
+    name: Typecheck and test
+    needs: [sync]
+    if: needs.sync.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Install native build libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libsecret-1-dev pkg-config
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Ensure Electron runtime is installed
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      - name: Typecheck
+        run: vpr typecheck
+
+      - name: Test
+        run: vp run --parallel --concurrency-limit 4 --filter '!t3' --filter '!@t3tools/monorepo' test
+
+  test_server:
+    name: Test server ${{ matrix.shard }}
+    needs: [sync]
+    if: needs.sync.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Install Chromium for server browser integration tests
+        run: node apps/server/node_modules/playwright-core/cli.js install --with-deps --only-shell chromium
+
+      - name: Test
+        run: vp run --filter t3 test --shard ${{ matrix.shard }}/${{ strategy.job-total }}
+
+  # Mirrors build_bundle in release.yml, minus the production relay tracing.
+  bundle:
+    name: Build JS bundle
+    needs: [sync]
+    if: needs.sync.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      T3CODE_CLERK_PUBLISHABLE_KEY: ${{ vars.CLERK_PUBLISHABLE_KEY }}
+      T3CODE_CLERK_JWT_TEMPLATE: ${{ vars.CLERK_JWT_TEMPLATE }}
+      T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: ${{ vars.CLERK_CLI_OAUTH_CLIENT_ID }}
+      T3CODE_RELAY_URL: ${{ vars.RELAY_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.ref }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Install browser secret helper build libraries
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install bundle dependencies
+        run: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ needs.sync.outputs.version }}"
+
+      - name: Build JS bundle
+        run: vp run build:desktop
+
+      - name: Upload JS bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          if-no-files-found: error
+          retention-days: 1
+
+  # The Windows job embeds this job's CLI archive as its WSL runtime and waits
+  # for a job named "Build Linux x64" in this run.
+  desktop_linux_x64:
+    name: Desktop Linux x64
+    needs: [sync, bundle]
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      version: ${{ needs.sync.outputs.version }}
+      ref: ${{ needs.sync.outputs.ref }}
+      release_channel: stable
+      relay_client_tracing: false
+      clerk_publishable_key: ${{ vars.CLERK_PUBLISHABLE_KEY }}
+      clerk_jwt_template: ${{ vars.CLERK_JWT_TEMPLATE }}
+      clerk_cli_oauth_client_id: ${{ vars.CLERK_CLI_OAUTH_CLIENT_ID }}
+      relay_url: ${{ vars.RELAY_URL }}
+      label: Linux x64
+      runner: ubuntu-24.04
+      platform: linux
+      target: AppImage
+      arch: x64
+      rust_target: x86_64-unknown-linux-gnu
+      resource_key: linux-x64
+      cli_archive: true
+
+  desktop_win_x64:
+    name: Desktop Windows x64
+    needs: [sync, bundle]
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      version: ${{ needs.sync.outputs.version }}
+      ref: ${{ needs.sync.outputs.ref }}
+      release_channel: stable
+      relay_client_tracing: false
+      clerk_publishable_key: ${{ vars.CLERK_PUBLISHABLE_KEY }}
+      clerk_jwt_template: ${{ vars.CLERK_JWT_TEMPLATE }}
+      clerk_cli_oauth_client_id: ${{ vars.CLERK_CLI_OAUTH_CLIENT_ID }}
+      relay_url: ${{ vars.RELAY_URL }}
+      label: Windows x64
+      runner: windows-2025
+      platform: win
+      target: nsis
+      arch: x64
+      rust_target: x86_64-pc-windows-msvc
+      resource_key: win32-x64
+      cli_archive: true
+
+  publish:
+    name: Publish release
+    needs: [sync, test, test_server, desktop_linux_x64, desktop_win_x64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: desktop-win-x64
+          path: release-assets
+
+      # electron-updater on Windows reads latest.yml; the build names it per arch.
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.sync.outputs.version }}
+          REF: ${{ needs.sync.outputs.ref }}
+          UPSTREAM_REF: ${{ needs.sync.outputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+          cd release-assets
+          mv latest-win-x64.yml latest.yml
+          rm -f builder-debug.yml
+          ls -la
+          gh release create "v$VERSION" ./* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$REF" \
+            --title "T3 Code v$VERSION" \
+            --notes "Fork build of $GITHUB_REPOSITORY@${REF:0:9}, based on pingdotgg/t3code@${UPSTREAM_REF:0:9}." \
+            --latest
