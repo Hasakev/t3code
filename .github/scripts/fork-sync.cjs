@@ -1,13 +1,12 @@
-#!/usr/bin/env node
 // Merges upstream main into the current branch, the same merge the
 // fork-release workflow runs. Works on Linux and Windows.
 //
-// Usage: node scripts/fork-sync.ts
+// Usage: node .github/scripts/fork-sync.cjs
 
-import { execFileSync } from "node:child_process";
+const { execFileSync } = require("node:child_process");
 
 const UPSTREAM = "https://github.com/pingdotgg/t3code.git";
-const git = (...args: string[]) =>
+const git = (...args) =>
   execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] }).trim();
 
 // --no-tags: upstream release tags would collide with the fork's own vX.Y.Z tags.

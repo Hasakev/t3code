@@ -54,6 +54,9 @@ jobs:
           node-version-file: package.json
           run-install: false
 
+      - name: Test fork versioning
+        run: node --test .github/scripts/fork-version.test.cjs
+
       - id: merge
         name: Merge upstream main
         env:
@@ -69,7 +72,7 @@ jobs:
           if ! git merge --no-edit upstream/main; then
             files="$(git diff --name-only --diff-filter=U)"
             git merge --abort
-            body="$(printf 'Merging upstream %s into main conflicts in:\n\n```\n%s\n```\n\nResolve locally with `node scripts/fork-sync.ts`, then push. Run: %s' \
+            body="$(printf 'Merging upstream %s into main conflicts in:\n\n```\n%s\n```\n\nResolve locally with `node .github/scripts/fork-sync.cjs`, then push. Run: %s' \
               "$(git rev-parse --short upstream/main)" "$files" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")"
             issue="$(gh issue list --state open --search 'in:title "Upstream merge conflict"' --json number --jq '.[0].number // empty')"
             if [[ -n "$issue" ]]; then
@@ -87,7 +90,7 @@ jobs:
           {
             echo "ref=$(git rev-parse HEAD)"
             echo "upstream_ref=$(git rev-parse upstream/main)"
-            echo "version=$(node scripts/fork-version.ts)"
+            echo "version=$(node .github/scripts/fork-version.cjs)"
             if git tag --points-at HEAD | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
               echo "skip=true"
             else

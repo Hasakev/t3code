@@ -17,7 +17,7 @@ Windows x64 desktop build. The build installs over the official app (same app id
 
 The updater only offers a version greater than the installed one, so fork versions encode
 the upstream version: upstream `0.0.45` ships as `0.0.45001`, `0.0.45002`, …, and upstream
-`0.0.46` starts at `0.0.46001` (`scripts/fork-version.ts`).
+`0.0.46` starts at `0.0.46001` (`.github/scripts/fork-version.cjs`).
 
 ## One-time setup
 
@@ -37,7 +37,7 @@ the upstream version: upstream `0.0.45` ships as `0.0.45001`, `0.0.45002`, …, 
 ## Day to day
 
 - Commit extensions to `main`. Prefer new files over edits to upstream files so merges stay clean.
-- To merge upstream locally (Linux or Windows): `node scripts/fork-sync.ts`. Resolve any
+- To merge upstream locally (Linux or Windows): `node .github/scripts/fork-sync.cjs`. Resolve any
   conflicts, commit, and push. The push triggers a release.
 - Builds are unsigned, so Windows SmartScreen warns on the first manual install. Updates
   install without prompting.
