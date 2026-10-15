@@ -30,6 +30,9 @@ jobs:
       actions: write
       contents: read
       issues: write
+    # gh resolves its repo from git remotes and would pick `upstream`.
+    env:
+      GH_REPO: ${{ github.repository }}
     outputs:
       ref: ${{ steps.merge.outputs.ref }}
       upstream_ref: ${{ steps.merge.outputs.upstream_ref }}
